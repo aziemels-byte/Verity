@@ -25,6 +25,15 @@ import { configRoutes } from "./modules/config/routes.js";
  * indexer is not keeping up: verdicts on the dashboard are stale. */
 const MAX_INDEXER_LAG_LEDGERS = 240;
 
+// Avoid an RPC request and two DB queries for every unthrottled health probe.
+const READINESS_CACHE_MS = 5_000;
+
+/** Match only the real health routes, irrespective of query strings. */
+function isHealthPath(url: string): boolean {
+  const pathname = url.split("?")[0];
+  return pathname === "/health" || pathname === "/health/live";
+}
+
 async function check(fn: () => Promise<unknown>): Promise<boolean> {
   try {
     await fn();
@@ -44,7 +53,7 @@ export function buildApp() {
   app.register(rateLimit, {
     max: env.RATE_LIMIT_PER_MINUTE,
     timeWindow: "1 minute",
-    allowList: (req) => req.url.startsWith("/health"),
+    allowList: (req) => isHealthPath(req.url),
     keyGenerator: (req) => {
       const header = req.headers.authorization;
       if (header?.startsWith("Bearer ")) {
@@ -87,7 +96,9 @@ export function buildApp() {
   app.get("/health/live", async () => ({ ok: true }));
 
   // Readiness: can this instance actually serve true data right now?
-  app.get("/health", async (_req, reply) => {
+  // Responses (including 503) are cached briefly. Concurrent probes share
+  // the same in-flight computation rather than stampeding DB and RPC.
+  async function computeReadiness() {
     const database = await check(() => sql`select 1`.execute(db));
     let latestLedger: number | null = null;
     const rpc = await check(async () => {
@@ -105,15 +116,42 @@ export function buildApp() {
     }
     const indexer = indexerLag === null || indexerLag <= MAX_INDEXER_LAG_LEDGERS;
     const ok = database && rpc && indexer;
-    reply.code(ok ? 200 : 503);
     return {
-      ok,
-      deployment: env.DEPLOYMENT_NAME,
-      network_passphrase: env.NETWORK_PASSPHRASE,
-      escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
-      workers: env.RUN_WORKERS,
-      checks: { database, rpc, indexer, indexer_lag_ledgers: indexerLag },
+      code: ok ? 200 : 503,
+      body: {
+        ok,
+        deployment: env.DEPLOYMENT_NAME,
+        network_passphrase: env.NETWORK_PASSPHRASE,
+        escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
+        workers: env.RUN_WORKERS,
+        checks: { database, rpc, indexer, indexer_lag_ledgers: indexerLag },
+      },
     };
+  }
+
+  // Cache is scoped to this app instance, never shared across test apps.
+  type ReadinessPromise = ReturnType<typeof computeReadiness>;
+  let cachedReadiness: { at: number; value: ReadinessPromise } | null = null;
+
+  function getReadiness(): ReadinessPromise {
+    const now = Date.now();
+    if (cachedReadiness && now - cachedReadiness.at < READINESS_CACHE_MS) {
+      return cachedReadiness.value;
+    }
+    const value = computeReadiness();
+    const entry = { at: now, value };
+    cachedReadiness = entry;
+    // Transient failures must not poison the cache for the whole TTL.
+    void value.catch(() => {
+      if (cachedReadiness === entry) cachedReadiness = null;
+    });
+    return value;
+  }
+
+  app.get("/health", async (_req, reply) => {
+    const { code, body } = await getReadiness();
+    reply.code(code);
+    return body;
   });
 
   app.register(wellKnownPlugin);
