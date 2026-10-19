@@ -197,38 +197,133 @@ submissions use, and decides which staked accounts may vote while
 
 ## API
 
-SEP-10 JWT auth (`GET /auth?account=G…`, sign, `POST /auth`). Every
-state-changing call is build → sign → relay: the backend returns unsigned
-XDR, the caller signs with their own key, and posts it back. The backend
-never holds a user's key, and a relay endpoint forwards only the EscrowGate
-call it was built for.
+Verity uses [SEP-10 authentication](#sign-in-and-token-lifetime) and
+**build, sign, relay** for state-changing Soroban transactions. The backend
+returns unsigned XDR; the caller signs it locally and relays the signature.
+The backend never holds users' keys. An authenticated call includes
+`Authorization: Bearer <JWT>`. Public calls need no token.
 
-```
-GET  /health, /health/live              readiness (DB, RPC, indexer) / liveness
-GET  /v1/config                         the contract's live rules
-POST /v1/artifacts                      upload a content-addressed artifact
-GET  /v1/artifacts/:hash
-POST /v1/submissions                    build submit()            -> unsigned XDR
-POST /v1/submissions/:id/relay          relay the signed XDR
-GET  /v1/submissions[/:id]              status, replays, spot-checks, challenge
-GET  /v1/submissions/:id/attestation    signed record of a settled verdict
-POST /v1/submissions/:id/challenge      build open_challenge()    -> unsigned XDR
-POST /v1/submissions/:id/challenge/relay
-GET  /v1/submissions/:id/proof          always "not available" in Phase 1
-POST /v1/reexecutors                    build register_reexecutor() -> unsigned XDR
-POST /v1/reexecutors/:id/withdraw       build withdraw_stake()    -> unsigned XDR
-POST /v1/reexecutors/:id/relay          relay a signed stake or withdrawal
-POST /v1/reexecutors/sync               mirror existing on-chain stake
-GET  /v1/reexecutors[/:id]              stake, standing, record
-GET  /v1/reexecutors/:id/assignments    work queue for that re-executor
-GET  /v1/challenges
-GET  /v1/taxonomy
-GET  /v1/reports/verification-rates
-POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
-```
+| Method | Endpoint | Bearer token | Purpose |
+| --- | --- | --- | --- |
+| GET | `/auth?account=G...` | No | SEP-10 challenge and network passphrase |
+| POST | `/auth` | No | Exchange signed challenge for a JWT |
+| GET | `/.well-known/stellar.toml` | No | SEP-10 authentication metadata |
+| GET | `/health`, `/health/live` | No | Readiness and liveness |
+| GET | `/v1/config` | No | Live contract configuration |
+| POST | `/v1/artifacts` | **Yes** | Upload content-addressed artifact |
+| GET | `/v1/artifacts/:hash` | No | Retrieve an artifact by hash |
+| POST | `/v1/submissions` | **Yes** | Build `submit()`, with idempotency |
+| POST | `/v1/submissions/:id/relay` | **Yes** | Relay signed submission XDR |
+| GET | `/v1/submissions` | No | Browse submissions |
+| GET | `/v1/submissions/:id` | No | Submission, replay and challenge status |
+| GET | `/v1/submissions/:id/attestation` | No | Signed settled-verdict record |
+| GET | `/v1/submissions/:id/proof` | No | Proof status (Phase 1: unavailable) |
+| POST | `/v1/submissions/:id/challenge` | **Yes** | Build `open_challenge()` |
+| POST | `/v1/submissions/:id/challenge/relay` | **Yes** | Relay signed challenge XDR |
+| POST | `/v1/reexecutors` | **Yes** | Build registration/stake XDR |
+| POST | `/v1/reexecutors/:id/withdraw` | **Yes** | Build withdrawal XDR |
+| POST | `/v1/reexecutors/:id/relay` | **Yes** | Relay signed re-executor XDR |
+| POST | `/v1/reexecutors/sync` | **Yes** | Mirror an existing on-chain stake |
+| GET | `/v1/reexecutors` | No | List re-executors |
+| GET | `/v1/reexecutors/:id` | No | Stake, standing and record |
+| GET | `/v1/reexecutors/:id/assignments` | **Yes** | Authenticated worker queue |
+| GET | `/v1/challenges` | No | Challenge list |
+| GET | `/v1/taxonomy` | No | Supported task taxonomy |
+| GET | `/v1/reports/verification-rates` | No | Verification statistics |
+| POST | `/v1/marketplaces` | **Yes** | Create or find caller's marketplace |
+| POST | `/v1/marketplaces/:id/webhooks` | **Yes** | Register the caller's webhook |
 
-Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
-`submission.slashed`, `submission.disputed`.
+Authentication is not authorization to act for another account. For example,
+a submitting agent is the only account allowed to relay its submission;
+withdrawals, worker assignments and webhook management are limited to
+their owning account or marketplace. Such violations return HTTP 403.
+
+### Sign-in and token lifetime
+
+1. Call `GET /auth?account=G...` using the account to authenticate.
+   The response contains `{ "transaction": "<challenge XDR>",
+   "network_passphrase": "<network>" }`.
+2. Sign that SEP-10 challenge with the account's wallet. It is valid for
+   **300 seconds**. POST `{ "transaction": "<signed XDR>" }` to `/auth`.
+3. On success, the response contains `{ "token": "<JWT>" }`; failed
+   challenge validation responds with HTTP 400 and an `error` message.
+   The JWT has a **one-hour lifetime** and contains the account in `sub`.
+4. Send `Authorization: Bearer <JWT>` for routes marked **Yes** above.
+
+A protected request without a bearer token returns HTTP 401
+`{ "error": "missing bearer token" }`; an invalid or expired token
+returns HTTP 401 `{ "error": "invalid or expired token" }`.
+`/.well-known/stellar.toml` advertises the SEP-10 auth endpoint and
+signing key.
+
+### Error shapes and limits
+
+A response's HTTP status is authoritative; inspect the JSON body rather
+than assuming every 4xx has identical wording:
+
+| Condition | Status | Example body |
+| --- | --- | --- |
+| Invalid parameters (Zod validation) | 400 | `{"error":"id: Invalid UUID"}` (path and wording vary) |
+| Invalid or missing bearer token | 401 | `{"error":"missing bearer token"}` |
+| Attempt to act for another account | 403 | `{"error":"forbidden"}` or an endpoint-specific ownership message |
+| Missing submission or other record | 404 | `{"error":"not found"}` (exact message varies) |
+| Artifact larger than configured size | 413 | `{"error":"artifact is larger than the 262144-byte limit"}` (default) |
+| EscrowGate contract rejection | 422 | `{"error":"EscrowGate rejected the transaction: <ErrorName>","contract_error":"<ErrorName>"}` |
+| Unexpected server error | 500 | `{"error":"internal error"}` |
+
+The custom Zod handler joins issues as `<path>: <message>` separated
+by semicolons. Other `HttpError` failures preserve their own status and
+have only `{ "error": "<message>" }`. For example, the network's 422
+transaction rejection is **not** a contract-error response and does not
+include `contract_error`. Relay confirmation can time out with HTTP 504;
+the transaction may still land, so query its status before retrying.
+
+Rate limiting defaults to **300 requests per minute**
+(`RATE_LIMIT_PER_MINUTE`), keyed by JWT account when the bearer token
+is valid, otherwise by caller IP. The backend currently exempts URLs
+beginning with `/health` from that limiter. The exact rate-limit
+response body is not specified here.
+
+`POST /v1/artifacts` accepts `{ "content_base64": "...",
+"content_type": "application/json" }` (`content_type` optional).
+A successful upload returns HTTP 201 with `content_hash`,
+`storage_ref`, `size_bytes` and `content_type`. A single artifact may
+be at most **262,144 bytes** by default (`ARTIFACT_MAX_BYTES`);
+the full HTTP request body is limited to **1 MiB**.
+
+### Submission idempotency
+
+`POST /v1/submissions` requires a nonempty `idempotency_key`.
+The key is checked **across all accounts**, not scoped to one account.
+Its response includes `submission`, `unsigned_transaction_xdr`, and
+`network_passphrase` in all successful cases.
+
+| Existing state of `idempotency_key` | Status | Result |
+| --- | --- | --- |
+| New key | 201 | New draft and unsigned XDR to sign |
+| Same account; unsigned draft still in database | 200 | Updates draft request values and builds fresh unsigned XDR |
+| Same account; already confirmed on-chain | 200 | Existing submission with `unsigned_transaction_xdr: null`; do not sign again |
+| Another account already owns the key | 409 | `{"error":"idempotency_key is already in use"}` |
+
+The scheduler purges unsigned drafts older than `DRAFT_TTL_S`
+(**3,600 seconds** by default). A draft retry is not the same as
+re-relaying a confirmed transaction.
+
+### Network passphrase for wallet signing
+
+`GET /auth` and `POST /v1/submissions` explicitly include
+`network_passphrase`. **Challenge build**
+(`POST /v1/submissions/:id/challenge`) returns only
+`{ "unsigned_transaction_xdr": "..." }` with HTTP 201.
+**Re-executor register** (`POST /v1/reexecutors`) and **withdraw**
+(`POST /v1/reexecutors/:id/withdraw`) return the relevant
+`reexecutor` row and `unsigned_transaction_xdr`, **without**
+`network_passphrase`. For those transactions, obtain the passphrase
+from `GET /v1/config` or use the known network configuration, not a
+hard-coded guess.
+
+Webhooks (HMAC-SHA256 in `x-verity-signature`):
+`submission.verified`, `submission.slashed`, `submission.disputed`.
 
 ## Known limits
 
