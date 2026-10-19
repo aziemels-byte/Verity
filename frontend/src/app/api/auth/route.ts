@@ -13,11 +13,12 @@ export async function POST(req: NextRequest) {
   const parsed = await readJsonBody(req);
   if (!parsed.ok) return parsed.response;
   const body = parsed.body;
+  const incomingAddress = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip");
   let res: Response;
   try {
     res = await fetch(`${BACKEND_URL}/auth`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(incomingAddress ? { "x-forwarded-for": incomingAddress } : {}) },
       body: JSON.stringify(body),
       cache: "no-store",
     });

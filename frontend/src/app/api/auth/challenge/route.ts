@@ -6,10 +6,11 @@ export async function GET(req: NextRequest) {
   if (!account) {
     return NextResponse.json({ error: "account query param required" }, { status: 400 });
   }
+  const incomingAddress = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip");
   try {
     const res = await fetch(
       `${BACKEND_URL}/auth?account=${encodeURIComponent(account)}`,
-      { cache: "no-store" }
+      { cache: "no-store", ...(incomingAddress ? { headers: { "x-forwarded-for": incomingAddress } } : {}) }
     );
     const data = await res.json().catch(() => ({}));
     return NextResponse.json(data, { status: res.status });
