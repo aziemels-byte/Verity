@@ -26,7 +26,7 @@ const TIMEOUT_MS = 10_000;
  */
 export class RetrievalTransientError extends Error {}
 
-function isPrivateAddress(ip: string): boolean {
+export function isPrivateAddress(ip: string): boolean {
   if (ip.includes(":")) {
     const v6 = ip.toLowerCase();
     return v6 === "::1" || v6 === "::" || v6.startsWith("fc") || v6.startsWith("fd") || v6.startsWith("fe80") || v6.startsWith("::ffff:");
@@ -54,7 +54,7 @@ interface PinnedTarget {
  * Returns the one address that was checked. The request is then made to
  * exactly that address, so the name cannot resolve somewhere else between
  * the check and the connection. */
-async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
+export async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -133,7 +133,7 @@ function getPinned(target: PinnedTarget): Promise<{ status: number; body: string
   });
 }
 
-function resolvePointer(doc: unknown, pointer: string): unknown {
+export function resolvePointer(doc: unknown, pointer: string): unknown {
   if (pointer === "") return doc;
   if (!pointer.startsWith("/")) throw new Error(`invalid JSON pointer: ${pointer}`);
   let node: any = doc;
