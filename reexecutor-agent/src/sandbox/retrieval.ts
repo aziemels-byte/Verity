@@ -54,7 +54,7 @@ interface PinnedTarget {
  * Returns the one address that was checked. The request is then made to
  * exactly that address, so the name cannot resolve somewhere else between
  * the check and the connection. */
-async export function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
+export async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
   let url: URL;
   try {
     url = new URL(raw);
