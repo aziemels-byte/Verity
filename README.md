@@ -225,10 +225,16 @@ GET  /v1/challenges
 GET  /v1/taxonomy
 GET  /v1/reports/verification-rates
 POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
+GET  /v1/marketplaces/:id/webhooks      list subscriptions (no secrets)
+PATCH /v1/marketplaces/:id/webhooks/:webhookId  activate/deactivate
 ```
 
-Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
-`submission.slashed`, `submission.disputed`.
+Webhooks (HMAC-SHA256 in `x-verity-signature`) accept only these event names:
+`submission.verified`, `submission.slashed`, `submission.disputed`.
+Registration rejects unknown event names and deduplicates repeats. Authenticated
+marketplace owners can list subscriptions without exposing their `secret` and
+use `PATCH` with `{ "active": false }` (or `true`) to disable or re-enable a
+subscription.
 
 ## Known limits
 
