@@ -30,13 +30,19 @@ export async function POST(req: NextRequest) {
   }
 
   const payload = JSON.parse(Buffer.from(data.token.split(".")[1], "base64url").toString("utf8"));
+  const remaining = typeof payload.exp === "number" ? Math.floor(payload.exp - Date.now() / 1000) : undefined;
+  if (remaining !== undefined && remaining <= 0) {
+    return NextResponse.json({ error: "The backend issued a token that has already expired." }, { status: 502 });
+  }
   const response = NextResponse.json({ account: payload.sub });
   response.cookies.set(SESSION_COOKIE, data.token, {
     httpOnly: true,
+    // Production requires HTTPS: on plain HTTP, browsers reject the Secure
+    // session cookie even if login returns 200 (docs/DEPLOY.md, section 4).
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     path: "/",
-    maxAge: 60 * 60,
+    ...(remaining === undefined ? {} : { maxAge: remaining }),
   });
   return response;
 }
