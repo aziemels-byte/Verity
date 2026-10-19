@@ -316,7 +316,9 @@ createServer(async (req, res) => {
     return;
   }
 
-  const rawBody = Buffer.concat(await Array.fromAsync(req));
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks);
   const signature = req.headers["x-verity-signature"];
   const expected = createHmac("sha256", secret).update(rawBody).digest();
   const received =
@@ -341,12 +343,7 @@ createServer(async (req, res) => {
 ```
 
 Set `WEBHOOK_SECRET` to the value you registered, and configure your
-public receiver URL to forward to `/verity/webhook`. The example uses
-`Array.fromAsync(req)`, available in Node 22; for Node 20, replace
-`Buffer.concat(await Array.fromAsync(req))` with an ordinary
-`for await (const chunk of req)` collection and `Buffer.concat(chunks)`.
-
-**Delivery semantics.** Verity makes **one attempt with no retries**.
+public receiver URL to forward to `/verity/webhook`. **Delivery semantics.** Verity makes **one attempt with no retries**.
 A 2xx response is recorded as `delivered`; any other response or
 connection failure is recorded as `failed` in the internal
 `webhook_delivery` table, with `attempts: 1`. Redirects are rejected
