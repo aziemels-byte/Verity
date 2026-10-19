@@ -227,8 +227,138 @@ GET  /v1/reports/verification-rates
 POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
 ```
 
-Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
-`submission.slashed`, `submission.disputed`.
+Webhook registration and delivery details: [webhook reference](#webhooks).
+
+### Webhooks
+
+A marketplace can subscribe to status changes **for submissions made by its
+own Stellar account**. When an account first calls `POST /v1/submissions`,
+Verity finds or creates the marketplace associated with that account. Calling
+`POST /v1/marketplaces` with a nonempty `name` returns the marketplace the
+authenticated account already owns, or creates it if none exists.
+
+**Register a subscription** by calling
+`POST /v1/marketplaces/:id/webhooks` with a bearer token identifying the
+marketplace's own account. The `:id` is a marketplace UUID (not a submission
+ID). A different account or a missing marketplace gets HTTP 403 with
+`{"error":"only the marketplace's own account can manage its webhooks"}`.
+
+```http
+POST /v1/marketplaces/<marketplace-uuid>/webhooks
+Authorization: Bearer <account-bearer-token>
+Content-Type: application/json
+
+{
+  "url": "https://receiver.example.com/verity/webhook",
+  "secret": "<a-unique-shared-secret-at-least-8-characters>",
+  "events": ["submission.verified", "submission.slashed", "submission.disputed"]
+}
+```
+
+The body requires a valid `url`, a `secret` of at least eight characters,
+and a nonempty array of event-name strings. Registration returns HTTP 201
+with the new subscription row. Event names are not validated against a fixed
+list at registration; the dispatcher sends only events whose exact names
+appear in the subscription's `events` array. Keep the shared secret private.
+
+| Event | Trigger | `data` |
+| --- | --- | --- |
+| `submission.verified` | A submission first transitions to `verified` | `submission_id`, `status: "verified"`, `tx_hash` |
+| `submission.slashed` | A submission first transitions to `slashed` | `submission_id`, `status: "slashed"`, `tx_hash` |
+| `submission.disputed` | A `challenge_opened` event inserts a new challenge row | `submission_id`, `status: "disputed"`, `tx_hash` |
+
+A terminal verdict dispatches an event only on the transition into that
+status; replaying the same verdict does not send another one. The disputed
+event is emitted only for a newly inserted challenge. A terminal
+`expired_unverified` verdict **does not send a webhook**. The event name
+`submission.verified` does **not** establish that consensus was reached:
+a verification window can produce a verified-by-default outcome. Query
+`GET /v1/submissions/:id` and inspect `resolution_method` for how the
+verdict was reached.
+
+**Delivery payload and signature.** The server sends an HTTP POST with
+`content-type: application/json` and `x-verity-signature`. Its exact body is
+`JSON.stringify({ event: eventType, data: payload })`. For example, this
+is a *shape example*, not a real submission or transaction:
+
+```json
+{
+  "event": "submission.verified",
+  "data": {
+    "submission_id": "<verity-submission-uuid>",
+    "status": "verified",
+    "tx_hash": null
+  }
+}
+```
+
+`submission_id` is Verity's UUID, **not** an on-chain numeric submission
+ID. `tx_hash` is the finalize/resolve transaction hash for a terminal
+verdict or the challenge transaction hash for a dispute; it can be `null`
+when a terminal transition is observed during reconciliation. The signature
+header is the **lowercase hexadecimal** HMAC-SHA256 of the **exact raw HTTP
+request body**, keyed with the subscription's `secret`. Do not parse and
+re-serialize JSON before verification.
+
+A minimal Node.js receiver (Node 20+) checks the header using a
+constant-time comparison before parsing the body:
+
+```js
+import { createServer } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const secret = process.env.WEBHOOK_SECRET;
+if (!secret) throw new Error("Set WEBHOOK_SECRET to the subscription secret");
+
+createServer(async (req, res) => {
+  if (req.method !== "POST" || req.url !== "/verity/webhook") {
+    res.writeHead(404).end();
+    return;
+  }
+
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks);
+  const signature = req.headers["x-verity-signature"];
+  const expected = createHmac("sha256", secret).update(rawBody).digest();
+  const received =
+    typeof signature === "string" && /^[0-9a-f]{64}$/.test(signature)
+      ? Buffer.from(signature, "hex")
+      : Buffer.alloc(0);
+
+  if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
+    res.writeHead(401).end("Invalid webhook signature");
+    return;
+  }
+
+  try {
+    const payload = JSON.parse(rawBody.toString("utf8"));
+    // Handle the verified envelope here; make processing idempotent.
+    console.log(payload.event, payload.data?.submission_id);
+    res.writeHead(204).end();
+  } catch {
+    res.writeHead(400).end("Invalid JSON");
+  }
+}).listen(8788);
+```
+
+Set `WEBHOOK_SECRET` to the value you registered, and configure your
+public receiver URL to forward to `/verity/webhook`. **Delivery semantics.** Verity makes **one attempt with no retries**.
+A 2xx response is recorded as `delivered`; any other response or
+connection failure is recorded as `failed` in the internal
+`webhook_delivery` table, with `attempts: 1`. Redirects are rejected
+(`redirect: "error"`), and outbound requests have a 30-second global
+timeout. Deliveries are attempted inline during verdict processing, and
+dispatch failures are only logged; **there is no delivery-log API or
+delivery guarantee**. Receivers should acknowledge promptly and make
+processing idempotent.
+
+**Receiver URL restrictions.** Only `http:` or `https:` URLs that
+resolve to **public addresses** are accepted. Private, loopback,
+link-local and unresolvable destinations are refused. The URL check runs
+both at registration and immediately before each delivery to mitigate DNS
+changes. In local development, use a public HTTPS request receiver or a
+public tunnel rather than `localhost`.
 
 ## Known limits
 
