@@ -55,7 +55,7 @@ export async function submissionsRoutes(app: FastifyInstance) {
   // specifies a per-id GET) — the dashboard has nothing to render a
   // submissions feed from without it, and faking one client-side would
   // violate the no-mocked-data requirement.
-  app.get("/v1/submissions", async (req) => {
+  app.get("/v1/submissions", async (req, reply) => {
     const query = z
       .object({
         marketplace_id: z.string().uuid().optional(),
@@ -75,7 +75,22 @@ export async function submissionsRoutes(app: FastifyInstance) {
     if (query.marketplace_id) qb = qb.where("marketplace_id", "=", query.marketplace_id);
     if (query.agent_id) qb = qb.where("agent_id", "=", query.agent_id);
     if (query.status) qb = qb.where("status", "=", query.status);
-    return qb.limit(query.limit ?? 50).offset(query.offset ?? 0).execute();
+    const limit = query.limit ?? 50;
+    const offset = query.offset ?? 0;
+    // Derive the count from the exact same filtered query, before paging.
+    // Clear SELECT/ORDER BY so Postgres only computes the matching row count.
+    const [page, count] = await Promise.all([
+      qb.limit(limit).offset(offset).execute(),
+      qb
+        .clearSelect()
+        .clearOrderBy()
+        .select((eb) => eb.fn.countAll<string>().as("total"))
+        .executeTakeFirstOrThrow(),
+    ]);
+    reply.header("x-total-count", String(Number(count.total)));
+    reply.header("x-limit", String(limit));
+    reply.header("x-offset", String(offset));
+    return page;
   });
 
   // Build-sign-relay-confirm step 1: create a pending row and hand back
