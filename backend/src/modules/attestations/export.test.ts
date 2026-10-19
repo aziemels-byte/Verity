@@ -87,7 +87,7 @@ describe("signed attestation export (#81)", () => {
   it("rejects a changed verdict with the same original signature", () => {
     const payload = buildAttestationPayload(submission, votes, issuedAt);
     const signature = signAttestation(canonicalJson(payload));
-    const tampered = { ...payload, claim: { ...payload.claim, verdict: "slashed" } };
+    const tampered = { ...payload, claim: { ...payload.claim, verdict: "slashed" as const } };
     assert.equal(verify(tampered, signature), false);
   });
 
