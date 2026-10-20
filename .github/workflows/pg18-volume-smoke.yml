@@ -1,0 +1,52 @@
+name: PostgreSQL 18 named-volume persistence (issue 57)
+
+on:
+  push:
+    branches:
+      - ci/verify-issue-57-pg18-volume
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres18-volume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: veritypg18smoke
+      ESCROW_GATE_CONTRACT_ID: CDUMMY
+      ZK_VERIFIER_REGISTRY_CONTRACT_ID: CDUMMY
+      BOND_ASSET_CONTRACT_ID: CDUMMY
+      POSTGRES_PASSWORD: test-password
+      KEEPER_SECRET_KEY: SDUMMY
+      SEP10_SIGNING_SECRET: SDUMMY
+      JWT_SECRET: dummy-test-only-not-a-real-secret
+      WEB_AUTH_DOMAIN: localhost
+      HOME_DOMAIN: localhost
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config -q
+      - name: Verify persistence and exactly one named mount
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() { docker compose down -v --remove-orphans || true; }
+          trap cleanup EXIT
+          docker compose up -d --wait postgres
+          docker compose exec -T postgres psql -U verity -d verity -v ON_ERROR_STOP=1 -c 'CREATE TABLE smoke_persistence (v integer NOT NULL); INSERT INTO smoke_persistence VALUES (57);'
+          cid=$(docker compose ps -q postgres)
+          docker inspect "$cid" --format '{{range .Mounts}}{{println .Type .Name .Destination}}{{end}}' | tee /tmp/pg-mounts
+          grep -Fx 'volume veritypg18smoke_pgdata /var/lib/postgresql' /tmp/pg-mounts
+          test "$(wc -l < /tmp/pg-mounts)" -eq 1
+          docker compose down
+          docker compose up -d --wait postgres
+          actual=$(docker compose exec -T postgres psql -U verity -d verity -At -c 'SELECT v FROM smoke_persistence')
+          test "$actual" = "57"
+          echo 'PASS: named volume persisted table data across compose down/up'
+          docker compose down -v
+          docker compose up -d --wait postgres
+          missing=$(docker compose exec -T postgres psql -U verity -d verity -At -c "SELECT to_regclass('public.smoke_persistence') IS NULL")
+          test "$missing" = t
+          echo 'PASS: down -v removed the database state'
