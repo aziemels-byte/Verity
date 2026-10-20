@@ -1,0 +1,91 @@
+name: Verify current PR 144 README against real attestation
+on:
+  push:
+    branches: [ci/verify-issue96-current-20261020]
+    paths: [.github/workflows/verify-issue-96.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-attestation:
+    if: github.repository == 'aziemels-byte/Verity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      VERITY_DEPLOYMENT: issue96-ci
+      SMOKE_AGENT_ALIAS: verity-issue96-ci-agent
+      SMOKE_CHALLENGER_ALIAS: verity-issue96-ci-challenger
+      SMOKE_ONLY: honest-deterministic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install pinned Stellar CLI
+        run: |
+          mkdir -p "$RUNNER_TEMP/stellar-cli"
+          curl --fail --location --retry 3 https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz -o "$RUNNER_TEMP/stellar-cli.tar.gz"
+          tar -xzf "$RUNNER_TEMP/stellar-cli.tar.gz" -C "$RUNNER_TEMP/stellar-cli"
+          echo "$RUNNER_TEMP/stellar-cli" >> "$GITHUB_PATH"
+      - name: Install dependencies and build bindings
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter escrow-gate --filter zk-verifier-registry build
+      - name: Deploy isolated testnet contracts and approve fleet
+        run: |
+          bash scripts/deploy_testnet.sh
+          bash scripts/bootstrap_reexecutors.sh
+      - name: Run real on-chain smoke and exact README snippet
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          bash scripts/dev.sh --no-web > "$RUNNER_TEMP/verity-dev.log" 2>&1 &
+          dev_pid=$!
+          trap 'kill "$dev_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for i in $(seq 1 180); do
+            if curl --fail --silent http://127.0.0.1:3001/health > /dev/null; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1
+          sleep 10
+          bash scripts/smoke.sh | tee evidence/smoke.log
+          node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const API = 'http://127.0.0.1:3001';
+          const response = await fetch(API + '/v1/submissions?status=verified');
+          if (!response.ok) throw new Error('Cannot list real submissions');
+          const rows = await response.json();
+          const row = rows.find(r => r.settled_at && r.chain_submission_id);
+          if (!row) throw new Error('No real settled submission');
+          const attResponse = await fetch(API + '/v1/submissions/' + row.id + '/attestation');
+          if (!attResponse.ok) throw new Error('No issued attestation');
+          const att = await attResponse.json();
+          const readme = readFileSync('README.md', 'utf8');
+          const marker = "node --input-type=module <<'JS'\n";
+          const start = readme.indexOf(marker);
+          if (start < 0) throw new Error('README snippet not found');
+          const snippet = readme.slice(start + marker.length).split('\nJS\n')[0];
+          writeFileSync('.issue96-verification.mjs', snippet);
+          const output = execFileSync(process.execPath, ['.issue96-verification.mjs'], {
+            env: { ...process.env, API, DEPLOYMENT: process.env.VERITY_DEPLOYMENT, SUBMISSION_ID: row.id },
+            encoding: 'utf8'
+          });
+          process.stdout.write(output);
+          writeFileSync('evidence/verification.log', output);
+          writeFileSync('evidence/attestation.json', JSON.stringify(att, null, 2));
+          writeFileSync('evidence/submission.json', JSON.stringify(row, null, 2));
+          writeFileSync('evidence/deployment.json', readFileSync('deployments/' + process.env.VERITY_DEPLOYMENT + '.json'));
+          JS
+      - name: Save public verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-96-real-attestation
+          path: evidence/
+          if-no-files-found: ignore
+          retention-days: 14
