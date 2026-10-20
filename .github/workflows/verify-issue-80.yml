@@ -1,0 +1,24 @@
+name: Verify issue 80 with test-runner prerequisite
+on:
+  push:
+    branches: [ci/verify-issue80-runner-20261020]
+    paths: [.github/workflows/verify-issue-80.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sep10-jwt:
+    if: github.repository == 'aziemels-byte/Verity'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter escrow-gate --filter zk-verifier-registry build
+      - run: pnpm --filter @verity/backend test
+      - run: pnpm typecheck
+      - run: pnpm lint
