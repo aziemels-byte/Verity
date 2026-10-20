@@ -65,7 +65,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd backend && ../node_modules/.bin/tsx src/index.ts) > "$RUNNER_TEMP/backend.log" 2>&1 &
+          (cd backend && ./node_modules/.bin/tsx src/index.ts) > "$RUNNER_TEMP/backend.log" 2>&1 &
           pid=$!
           trap 'kill "$pid" 2>/dev/null || true; tail -50 "$RUNNER_TEMP/backend.log"' EXIT
           ready=0
