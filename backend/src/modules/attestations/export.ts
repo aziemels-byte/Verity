@@ -1,3 +1,5 @@
+import type { SubmissionTable } from "@verity/db";
+import type { Selectable } from "kysely";
 import { db } from "../../db.js";
 import { env } from "../../config/env.js";
 import { keeperKeypair } from "../../chain/keeper.js";
@@ -8,6 +10,64 @@ import { canonicalJson } from "../../chain/canonical.js";
  * the attestation is signed, stored, and served by this API. "none" says
  * exactly that rather than naming a registry it never reached. */
 export const ATTESTATION_TARGET = "none";
+
+type AttestationSubmission = Pick<
+  Selectable<SubmissionTable>,
+  | "id"
+  | "agent_id"
+  | "escrow_ref"
+  | "chain_submission_id"
+  | "task_type"
+  | "status"
+  | "resolution_method"
+  | "chain_tx_hash"
+  | "finalize_tx_hash"
+>;
+
+type AttestationVote = {
+  stellar_account: string;
+  match: boolean | null;
+  tx_hash: string | null;
+};
+
+/** Build exactly the versioned payload stored by the attestation export.
+ * Caller supplies the timestamp so it can be reproduced in tests. */
+export function buildAttestationPayload(
+  submission: AttestationSubmission,
+  votes: AttestationVote[],
+  issuedAt: Date
+) {
+  return {
+    schema: "verity.attestation.v2",
+    network_passphrase: env.NETWORK_PASSPHRASE,
+    escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
+    attestor: { type: "verity-verification-layer", stellar_account: keeperKeypair.publicKey() },
+    subject: {
+      agent_stellar_account: submission.agent_id,
+      escrow_ref: submission.escrow_ref,
+      submission_id: submission.id,
+      chain_submission_id: submission.chain_submission_id,
+    },
+    claim: {
+      task_type: submission.task_type,
+      verdict: submission.status,
+      resolution_method: submission.resolution_method,
+      attestations: votes.map((v) => ({
+        reexecutor: v.stellar_account,
+        matched: v.match,
+        tx_hash: v.tx_hash,
+      })),
+    },
+    submit_tx_hash: submission.chain_tx_hash,
+    finalize_tx_hash: submission.finalize_tx_hash,
+    issued_at: issuedAt.toISOString(),
+  };
+}
+
+/** Lowercase/base64 transport for an Ed25519 signature over canonical JSON bytes. */
+export function signAttestation(canonical: string): string {
+  return Buffer.from(keeperKeypair.sign(Buffer.from(canonical))).toString("base64");
+}
 
 /**
  * A versioned payload describing a submission's terminal verdict, signed with
@@ -37,34 +97,9 @@ export async function exportAttestation(submissionId: string): Promise<boolean> 
     .orderBy("replay.tx_hash")
     .execute();
 
-  const payload = {
-    schema: "verity.attestation.v2",
-    network_passphrase: env.NETWORK_PASSPHRASE,
-    escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
-    attestor: { type: "verity-verification-layer", stellar_account: keeperKeypair.publicKey() },
-    subject: {
-      agent_stellar_account: submission.agent_id,
-      escrow_ref: submission.escrow_ref,
-      submission_id: submission.id,
-      chain_submission_id: submission.chain_submission_id,
-    },
-    claim: {
-      task_type: submission.task_type,
-      verdict: submission.status,
-      resolution_method: submission.resolution_method,
-      attestations: votes.map((v) => ({
-        reexecutor: v.stellar_account,
-        matched: v.match,
-        tx_hash: v.tx_hash,
-      })),
-    },
-    submit_tx_hash: submission.chain_tx_hash,
-    finalize_tx_hash: submission.finalize_tx_hash,
-    issued_at: new Date().toISOString(),
-  };
-
+  const payload = buildAttestationPayload(submission, votes, new Date());
   const canonical = canonicalJson(payload);
-  const signature = Buffer.from(keeperKeypair.sign(Buffer.from(canonical))).toString("base64");
+  const signature = signAttestation(canonical);
 
   // One attestation per submission: nothing is inserted when one already exists.
   const inserted = await db
