@@ -1,0 +1,79 @@
+name: Verify issue 95 fresh env startup
+on:
+  push:
+    branches: [ci/verify-issue95-backend-start-20261020]
+    paths: [.github/workflows/verify-issue-95.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backend-start:
+    if: github.repository == 'aziemels-byte/Verity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter escrow-gate --filter zk-verifier-registry build
+      - name: Copy fresh backend environment and populate local-only required secrets
+        run: |
+          set -euo pipefail
+          cp backend/.env.example backend/.env
+          node --input-type=module <<'JS'
+          import { createRequire } from "node:module";
+          import { readFileSync, writeFileSync } from "node:fs";
+          const require = createRequire(new URL("./backend/package.json", import.meta.url));
+          const { Keypair, StrKey } = require("@stellar/stellar-sdk");
+          const fakeContract = StrKey.encodeContract(Buffer.alloc(32));
+          const vars = {
+            ESCROW_GATE_CONTRACT_ID: fakeContract,
+            ZK_VERIFIER_REGISTRY_CONTRACT_ID: fakeContract,
+            BOND_ASSET_CONTRACT_ID: fakeContract,
+            KEEPER_SECRET_KEY: Keypair.random().secret(),
+            JWT_SECRET: "ci-test-only-".repeat(5),
+            RUN_WORKERS: "false"
+          };
+          let text = readFileSync("backend/.env", "utf8");
+          for (const [k, v] of Object.entries(vars)) {
+            if (!new RegExp("^" + k + "=", "m").test(text)) throw new Error("Missing existing env line: " + k);
+            text = text.replace(new RegExp("^" + k + "=.*$", "m"), k + "=" + v);
+          }
+          writeFileSync("backend/.env", text, { mode: 0o600 });
+          const defaults = {
+            REEXECUTOR_LIVENESS_S: "60",
+            REPLAY_OVERASSIGN: "1",
+            REPLAY_REASSIGN_AFTER_S: "120",
+            DRAFT_TTL_S: "3600",
+            ARTIFACT_MAX_BYTES: "262144",
+            RATE_LIMIT_PER_MINUTE: "300"
+          };
+          const tmpl = readFileSync("backend/.env.example","utf8");
+          const doc = readFileSync("docs/DEPLOY.md","utf8");
+          for (const [k,v] of Object.entries(defaults)) {
+            if (!tmpl.includes("# " + k + "=" + v)) throw new Error("Missing example: " + k);
+            if (!doc.includes("`" + k + "` | `" + v + "`")) throw new Error("Missing documented default: " + k);
+          }
+          if (!doc.includes("1 MiB") || !doc.includes("docker-compose.yml")) throw new Error("Missing deployment caveats");
+          console.log("PASS: all six environment template defaults match docs");
+          JS
+      - name: Boot API-only backend with fresh copied configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd backend && ../node_modules/.bin/tsx src/index.ts) > "$RUNNER_TEMP/backend.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; tail -50 "$RUNNER_TEMP/backend.log"' EXIT
+          ready=0
+          for i in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:3001/health > "$RUNNER_TEMP/health.json"; then ready=1; break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/health.json" || true
+          test "$ready" = 1
+          echo "PASS: copied .env with configured local secrets starts the API health route"
