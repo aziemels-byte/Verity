@@ -1,0 +1,63 @@
+name: Verify issue 97 exact README receiver
+on:
+  push:
+    branches: [ci/verify-issue97-receiver-20261020]
+    paths: [.github/workflows/verify-issue-97.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hmac-receiver:
+    if: github.repository == 'aziemels-byte/Verity'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run README example against valid and adversarial requests
+        run: |
+          node --input-type=module <<'JS'
+          import assert from "node:assert/strict";
+          import {readFileSync,writeFileSync} from "node:fs";
+          import {spawn,execFileSync} from "node:child_process";
+          import {createHmac} from "node:crypto";
+          const readme=readFileSync("README.md","utf8");
+          const pos=readme.indexOf("This minimal Node.js receiver");
+          assert.ok(pos>=0,"README receiver section missing");
+          const match=readme.slice(pos).match(/```js\n([\s\S]*?)\n```/);
+          assert.ok(match?.[1],"Node.js receiver fenced block missing");
+          writeFileSync(".issue97-receiver.mjs",match[1]);
+          const secret="a-test-secret-for-issue97";
+          const receiver=spawn(process.execPath,[".issue97-receiver.mjs"],{
+            env:{...process.env,VERITY_WEBHOOK_SECRET:secret},
+            stdio:"inherit"
+          });
+          try{
+            let ready=false;
+            for(let i=0;i<60;i++){
+              if(receiver.exitCode!==null)throw new Error("Receiver exited before listening");
+              try{
+                const r=await fetch("http://127.0.0.1:8080/",{method:"GET"});
+                if(r.status===405){ready=true;break;}
+              }catch{}
+              await new Promise(resolve=>setTimeout(resolve,100));
+            }
+            assert.ok(ready,"Receiver did not start");
+            const body=JSON.stringify({event:"submission.verified",data:{submission_id:"example-id",status:"verified",tx_hash:null}});
+            const digest=createHmac("sha256",secret).update(body).digest("hex");
+            const openssl=execFileSync("openssl",["dgst","-sha256","-hmac",secret],{input:body,encoding:"utf8"});
+            assert.ok(openssl.includes(digest),"OpenSSL and Node.js HMAC differ");
+            const send=async(raw,signature)=>fetch("http://127.0.0.1:8080/",{
+              method:"POST",headers:signature===null?{}:{"x-verity-signature":signature},
+              body:raw
+            }).then(x=>x.status);
+            assert.equal(await send(body,digest),204);
+            assert.equal(await send(body+" ",digest),401);
+            assert.equal(await send(body,null),401);
+            assert.equal(await send(body,"invalid"),401);
+            assert.equal(await send(body,digest.toUpperCase()),401);
+            assert.equal((await fetch("http://127.0.0.1:8080/",{method:"GET"})).status,405);
+            console.log("PASS: actual README receiver + Node/OpenSSL HMAC; valid=204, tampered/missing/malformed/uppercase=401, GET=405");
+          }finally{receiver.kill();}
+          JS
