@@ -61,19 +61,36 @@ jobs:
           if (!doc.includes("1 MiB") || !doc.includes("docker-compose.yml")) throw new Error("Missing deployment caveats");
           console.log("PASS: all six environment template defaults match docs");
           JS
-      - name: Boot API-only backend with fresh copied configuration
+      - name: Boot embedded Postgres, migrate, and run backend health check
         shell: bash
         run: |
           set -euo pipefail
-          (cd backend && ./node_modules/.bin/tsx src/index.ts) > "$RUNNER_TEMP/backend.log" 2>&1 &
-          pid=$!
-          trap 'kill "$pid" 2>/dev/null || true; tail -50 "$RUNNER_TEMP/backend.log"' EXIT
-          ready=0
-          for i in $(seq 1 40); do
-            if curl --fail --silent http://127.0.0.1:3001/health > "$RUNNER_TEMP/health.json"; then ready=1; break; fi
-            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+          (cd db && ./node_modules/.bin/tsx src/dev-postgres-daemon.ts "$GITHUB_WORKSPACE/.pgdata" "" 5433) > "$RUNNER_TEMP/postgres.log" 2>&1 &
+          pg_pid=$!
+          api_pid=""
+          cleanup() {
+            if [ -n "$api_pid" ]; then kill "$api_pid" 2>/dev/null || true; fi
+            kill "$pg_pid" 2>/dev/null || true
+            tail -30 "$RUNNER_TEMP/postgres.log" || true
+            tail -30 "$RUNNER_TEMP/backend.log" || true
+          }
+          trap cleanup EXIT
+          postgres_ready=0
+          for i in $(seq 1 120); do
+            if (echo > /dev/tcp/127.0.0.1/5433) >/dev/null 2>&1; then postgres_ready=1; break; fi
+            if ! kill -0 "$pg_pid" 2>/dev/null; then break; fi
             sleep 1
           done
-          cat "$RUNNER_TEMP/health.json" || true
+          test "$postgres_ready" = 1
+          (cd db && DATABASE_URL=postgres://verity:verity@127.0.0.1:5433/verity ./node_modules/.bin/tsx src/migrate.ts)
+          (cd backend && ./node_modules/.bin/tsx src/index.ts) > "$RUNNER_TEMP/backend.log" 2>&1 &
+          api_pid=$!
+          ready=0
+          for i in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:3001/health > "$RUNNER_TEMP/health.json"; then ready=1; break; fi
+            if ! kill -0 "$api_pid" 2>/dev/null; then break; fi
+            sleep 1
+          done
           test "$ready" = 1
-          echo "PASS: copied .env with configured local secrets starts the API health route"
+          cat "$RUNNER_TEMP/health.json"
+          echo "PASS: fresh copied env plus local secrets boots healthy backend with migrations"
