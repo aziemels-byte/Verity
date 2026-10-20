@@ -39,7 +39,18 @@ jobs:
           cid=$(docker compose ps -q postgres)
           docker inspect "$cid" --format '{{range .Mounts}}{{println .Type .Name .Destination}}{{end}}' | tee /tmp/pg-mounts
           grep -Fx 'volume veritypg18smoke_pgdata /var/lib/postgresql' /tmp/pg-mounts
-          test "$(wc -l < /tmp/pg-mounts)" -eq 1
+          test "$(grep -cve '^
+          docker compose down
+          docker compose up -d --wait postgres
+          actual=$(docker compose exec -T postgres psql -U verity -d verity -At -c 'SELECT v FROM smoke_persistence')
+          test "$actual" = "57"
+          echo 'PASS: named volume persisted table data across compose down/up'
+          docker compose down -v
+          docker compose up -d --wait postgres
+          missing=$(docker compose exec -T postgres psql -U verity -d verity -At -c "SELECT to_regclass('public.smoke_persistence') IS NULL")
+          test "$missing" = t
+          echo 'PASS: down -v removed the database state'
+ /tmp/pg-mounts)" -eq 1
           docker compose down
           docker compose up -d --wait postgres
           actual=$(docker compose exec -T postgres psql -U verity -d verity -At -c 'SELECT v FROM smoke_persistence')
