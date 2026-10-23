@@ -1,0 +1,74 @@
+name: Wave 10 auth prerequisite acceptance audit
+on:
+  push:
+    branches: [ci/wave10-audit-20261023]
+    paths: [.github/workflows/verify-wave10-auth.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  auth-acceptance:
+    if: github.repository == 'aziemels-byte/Verity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install locked dependencies and build generated bindings
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter escrow-gate --filter zk-verifier-registry build
+      - name: Verify main, PR183 and exact PR154 prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/wave10-auth-evidence"
+          mkdir -p "$evidence"
+          git fetch https://github.com/DevQwinB/Verity.git main refs/pull/183/head:refs/remotes/pr/183 refs/pull/154/head:refs/remotes/pr/154
+          BASE=f2f1ae59901ad71426ddb962cf25b22cd9e5e6c5
+          PR183=8cf94c4f350447006a8b370d560f4b9b49e4fc47
+          PR154=b4b377b536b2bbcaa72322c7052a86222773cf8b
+          test "$(git rev-parse pr/183)" = "$PR183"
+          test "$(git rev-parse pr/154)" = "$PR154"
+          cat > "$RUNNER_TEMP/no-network-auth.mjs" <<'JS'
+          import net from 'node:net';import tls from 'node:tls';import dns from 'node:dns';import dp from 'node:dns/promises';import {syncBuiltinESMExports} from 'node:module';
+          const no=()=>{throw Error('Unexpected network access in auth tests')};
+          net.Socket.prototype.connect=no;tls.connect=no;dns.lookup=no;dp.lookup=no;globalThis.fetch=no;syncBuiltinESMExports();
+          JS
+          export NODE_OPTIONS="--import=$RUNNER_TEMP/no-network-auth.mjs"
+          git checkout --detach "$BASE"
+          test ! -e backend/.env
+          pnpm --filter @verity/backend test 2>&1 | tee "$evidence/main-standard.log"
+          node -e 'if (JSON.parse(require("fs").readFileSync("backend/package.json")).scripts.test) process.exit(1)'
+          pnpm typecheck 2>&1 | tee "$evidence/main-typecheck.log"
+          git checkout --detach "$PR183"
+          pnpm --filter @verity/backend test 2>&1 | tee "$evidence/pr183-standard-no-runner.log"
+          pnpm --filter @verity/backend exec tsx --test src/auth/sep10.test.ts 2>&1 | tee "$evidence/pr183-direct.log"
+          grep -q '# pass 12' "$evidence/pr183-direct.log"
+          git checkout --detach "$BASE"
+          git show "$PR183:backend/src/auth/sep10.test.ts" > backend/src/auth/sep10.test.ts
+          pnpm --filter @verity/backend exec tsx --test src/auth/sep10.test.ts 2>&1 | tee "$evidence/main-plus-pr183-direct.log"
+          grep -q '# pass 12' "$evidence/main-plus-pr183-direct.log"
+          git diff "$PR154^" "$PR154" > "$evidence/exact-PR154.patch"
+          git apply --check "$evidence/exact-PR154.patch"
+          git apply "$evidence/exact-PR154.patch"
+          pnpm --filter @verity/backend test 2>&1 | tee "$evidence/combined-test.log"
+          grep -q '# tests 12' "$evidence/combined-test.log"
+          grep -q '# pass 12' "$evidence/combined-test.log"
+          grep -q '# fail 0' "$evidence/combined-test.log"
+          pnpm --filter @verity/backend test 2>&1 | tee "$evidence/combined-repeat.log"
+          grep -q '# pass 12' "$evidence/combined-repeat.log"
+          pnpm typecheck 2>&1 | tee "$evidence/combined-typecheck.log"
+          git diff --check
+          printf '%s\n' "BASE=$BASE" "PR183=$PR183" "PR154=$PR154" "No backend/.env; network disabled during tests; exact two-file PR154 patch" > "$evidence/context.txt"
+      - name: Save acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wave10-auth-acceptance
+          path: ${{ runner.temp }}/wave10-auth-evidence/
+          retention-days: 14
